@@ -4,7 +4,7 @@ import { useGameState } from '../hooks/useGameState';
 import { Trophy, Layers, Loader2, PlayCircle, CheckCircle, XCircle, ArrowRight, RotateCcw, Sparkles, Target, Zap, Award } from 'lucide-react';
 
 const GameScreen = () => {
-  const { gameState, teams, categories, currentQuestion, currentCategoryName } = useGameState();
+  const { gameState, teams, categories, currentQuestion, currentCategoryName, refetchTeams } = useGameState();
   const [loading, setLoading] = useState(false);
   
   // UI State for instant feedback
@@ -15,29 +15,32 @@ const GameScreen = () => {
   const [revealResult, setRevealResult] = useState(null);
 
   // Control State
-  const [selectedRound, setSelectedRound] = useState('Easy');
   const [selectedTeamId, setSelectedTeamId] = useState('');
 
   // --- SYNC WITH DB ---
   useEffect(() => {
     if (gameState) {
-      if(gameState.current_round) setSelectedRound(gameState.current_round);
-      if(gameState.current_team_id) {
+      // Only sync team ID if we don't have a local selection yet
+      // This prevents overwriting user selections with stale DB values
+      if (!selectedTeamId && gameState.current_team_id) {
+        console.log(`🔄 Syncing team from DB: ${gameState.current_team_id}`);
         setSelectedTeamId(gameState.current_team_id);
-      } else if (teams.length > 0) {
-        // Auto-select first active team if none selected
+      } else if (!selectedTeamId && teams.length > 0) {
+        // Auto-select first active team only if none selected
         const firstActiveTeam = teams.find(t => t.is_active !== false);
         if (firstActiveTeam) {
+          console.log(`🆕 Auto-selecting first team: ${firstActiveTeam.name}`);
           setSelectedTeamId(firstActiveTeam.id);
           supabase.from('game_state').update({ current_team_id: firstActiveTeam.id }).eq('id', 1);
         }
       }
       
-      // Sync Category Data
+      // Sync Category Data - but ONLY reset if no question is currently showing
+      // This prevents clearing the result message when scoresheet updates
       if (gameState.current_category_id) {
         setLocalCategoryId(gameState.current_category_id);
-      } else if (!gameState.current_category_id) {
-        // Reset for new turn
+      } else if (!gameState.current_category_id && !localQuestion) {
+        // Only reset for new turn if there's no active question
         setLocalCategory(null);
         setLocalCategoryId(null);
         setLocalQuestion(null);
@@ -45,7 +48,7 @@ const GameScreen = () => {
         setRevealResult(null);
       }
     }
-  }, [gameState, teams]);
+  }, [gameState, teams, localQuestion, selectedTeamId]);
 
   // --- ACTIONS ---
   
@@ -62,7 +65,7 @@ const GameScreen = () => {
 
     try {
       const { data: validQuestions, error } = await supabase.from('questions')
-          .select('category_id').eq('difficulty', selectedRound).eq('is_used', false);
+          .select('category_id').eq('difficulty', gameState.current_round).eq('is_used', false);
 
       if (error || !validQuestions.length) { 
           setLoading(false); 
@@ -104,13 +107,13 @@ const GameScreen = () => {
     try {
         const { data: questions, error } = await supabase.from('questions').select('*')
             .eq('category_id', activeCategoryId)
-            .eq('difficulty', selectedRound)
+            .eq('difficulty', gameState.current_round)
             .eq('is_used', false);
 
         if (error) throw error;
 
         if (!questions || questions.length === 0) {
-            alert(`No unused questions found for ${localCategory} (${selectedRound})!`);
+            alert(`No unused questions found for ${localCategory} (${gameState.current_round})!`);
             setLocalCategory(null);
             setLocalCategoryId(null);
             return;
@@ -139,25 +142,65 @@ const GameScreen = () => {
     }
   };
 
-  // 4. MCQ Interaction
+  // 4. MCQ Interaction with Score Update
   const handleOptionClick = async (optionKey) => {
     if (revealResult) return; 
     if (!localQuestion) return;
     
+    console.log(`🔍 Option clicked: ${optionKey}`);
+    console.log(`📋 Full question data:`, localQuestion);
+    console.log(`📋 Correct option: "${localQuestion.correct_option}" (type: ${typeof localQuestion.correct_option})`);
+    console.log(`🔤 Selected option: "${optionKey}" (type: ${typeof optionKey})`);
+    
     setSelectedOption(optionKey);
 
     const isCorrect = optionKey === localQuestion.correct_option;
+    console.log(`✅ Is Correct? ${isCorrect}`);
     setRevealResult(isCorrect ? 'correct' : 'wrong');
 
     if (isCorrect) {
-        const pointsMap = { 'Easy': 100, 'Moderate': 150, 'Hard': 200, 'Star Reveal': 300 };
-        const points = pointsMap[selectedRound] || 0;
-        const currentTeam = teams.find(t => t.id === selectedTeamId);
-        if(currentTeam) {
-            await supabase.from('teams').update({ score: currentTeam.score + points }).eq('id', currentTeam.id);
+        try {
+            const pointsMap = { 'Easy': 100, 'Moderate': 150, 'Hard': 200, 'Star Reveal': 300 };
+            const points = pointsMap[gameState.current_round] || 0;
+            const currentTeam = teams.find(t => t.id === selectedTeamId);
+            
+            console.log(`👥 Looking for team ID: ${selectedTeamId}`);
+            console.log(`👥 Available teams:`, teams.map(t => ({ id: t.id, name: t.name })));
+            console.log(`👥 Current team found: ${currentTeam?.name || 'NOT FOUND'}`);
+            
+            if(currentTeam) {
+                const newScore = currentTeam.score + points;
+                console.log(`🎯 Updating team ${currentTeam.name}: ${currentTeam.score} + ${points} = ${newScore}`);
+                
+                // Update the score in database
+                const { error: updateError } = await supabase
+                    .from('teams')
+                    .update({ score: newScore })
+                    .eq('id', currentTeam.id);
+                
+                if (updateError) {
+                    console.error('❌ Error updating team score:', updateError);
+                } else {
+                    console.log('✅ Score updated in database');
+                    
+                    // Wait briefly then refetch to ensure DB is updated
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                    
+                    console.log('🔄 Refetching teams...');
+                    await refetchTeams();
+                    console.log('✅ Teams refetched');
+                }
+            }
+        } catch (err) {
+            console.error('❌ Unexpected error:', err);
         }
     }
-    await supabase.from('game_state').update({ show_answer: true }).eq('id', 1);
+    
+    try {
+        await supabase.from('game_state').update({ show_answer: true }).eq('id', 1);
+    } catch (err) {
+        console.error('Error updating game state:', err);
+    }
   };
 
   // 5. Next Turn - Auto-advance to next team or round
@@ -173,27 +216,42 @@ const GameScreen = () => {
     if (activeTeams.length === 0) return alert("No active teams!");
 
     // Find current team index
-    const currentTeamIndex = activeTeams.findIndex(t => t.id === selectedTeamId);
+    let currentTeamIndex = activeTeams.findIndex(t => t.id === selectedTeamId);
+    
+    // If team not found (first turn or invalid state), start from 0
+    if (currentTeamIndex === -1) {
+      console.log('⚠️ Current team not found, starting from Team 0');
+      currentTeamIndex = 0;
+    }
     
     // Calculate next team index (cycle through active teams)
     let nextTeamIndex = (currentTeamIndex + 1) % activeTeams.length;
     const nextTeam = activeTeams[nextTeamIndex];
+    
+    console.log(`📊 Team Rotation: Current index=${currentTeamIndex}, Next index=${nextTeamIndex}, Next team=${nextTeam.name}`);
 
     // Check if we've cycled back to team 0 (all teams played in this round)
     const allTeamsCompleted = nextTeamIndex === 0;
+    
+    console.log(`🔄 All teams completed? ${allTeamsCompleted} (nextTeamIndex=${nextTeamIndex}, activeTeams.length=${activeTeams.length})`);
 
     if (allTeamsCompleted) {
       // Auto-advance round
       const rounds = ['Easy', 'Moderate', 'Hard', 'Star Reveal'];
-      const currentRoundIndex = rounds.indexOf(selectedRound);
+      const currentRoundIndex = rounds.indexOf(gameState.current_round);
+      console.log(`📈 Current round: ${gameState.current_round} (index: ${currentRoundIndex})`);
       const nextRound = currentRoundIndex < rounds.length - 1 ? rounds[currentRoundIndex + 1] : null;
+      console.log(`📈 Next round: ${nextRound || 'GAME OVER'}`);
 
       if (!nextRound) {
         alert("Game Over! All rounds completed!");
         return;
       }
 
+      console.log(`🚀 Advancing to round: ${nextRound}`);
+      
       // Update game state: new round, first team
+      // The database is now the source of truth - subscription will update the component
       await supabase.from('game_state').update({ 
           current_question_id: null, 
           show_answer: false, 
@@ -202,7 +260,13 @@ const GameScreen = () => {
           current_team_id: nextTeam.id
       }).eq('id', 1);
 
-      setSelectedRound(nextRound);
+      console.log(`✅ Round update sent to database: ${nextRound}`);
+      
+      // Wait for database to propagate and then manually refetch to ensure gameState is updated
+      await new Promise(resolve => setTimeout(resolve, 500));
+      console.log(`🔄 Manually refetching gameState after round change...`);
+      await refetchTeams();
+      console.log(`✅ GameState refetched after round advance`);
     } else {
       // Same round, next team
       await supabase.from('game_state').update({ 
@@ -223,14 +287,26 @@ const GameScreen = () => {
     setLoading(true);
 
     try {
+      console.log('🔄 Starting game reset...');
+      
       // 1. Reset ALL team scores to 0
-      await supabase.from('teams').update({ score: 0 }).neq('id', -1);
+      const { error: teamsError } = await supabase.from('teams').update({ score: 0 }).neq('id', -1);
+      if (teamsError) {
+        console.error('❌ Error resetting teams:', teamsError);
+        throw teamsError;
+      }
+      console.log('✅ Team scores reset to 0');
 
       // 2. Mark ALL questions as unused
-      await supabase.from('questions').update({ is_used: false }).neq('id', -1);
+      const { error: questionsError } = await supabase.from('questions').update({ is_used: false }).neq('id', -1);
+      if (questionsError) {
+        console.error('❌ Error resetting questions:', questionsError);
+        throw questionsError;
+      }
+      console.log('✅ Questions marked as unused');
 
       // 3. Reset game state
-      await supabase.from('game_state').update({
+      const { error: stateError } = await supabase.from('game_state').update({
         current_round: 'Easy',
         current_team_id: null,
         current_category_id: null,
@@ -238,15 +314,26 @@ const GameScreen = () => {
         show_answer: false,
         is_spinning: false
       }).eq('id', 1);
+      
+      if (stateError) {
+        console.error('❌ Error resetting game state:', stateError);
+        throw stateError;
+      }
+      console.log('✅ Game state reset');
 
-      alert("Game Reset Successfully!");
-      setSelectedRound('Easy');
+      // 4. Refetch to update UI
+      await refetchTeams();
+      console.log('✅ Teams refetched after reset');
+
+      alert("✅ Game Reset Successfully!");
+      // Round will be synced from DB after reset completes
       setLocalCategory(null);
       setLocalCategoryId(null);
       setLocalQuestion(null);
       setSelectedOption(null);
       setRevealResult(null);
     } catch (err) {
+      console.error('❌ Error resetting game:', err);
       alert("Error resetting game: " + err.message);
     } finally {
       setLoading(false);
@@ -292,7 +379,7 @@ const GameScreen = () => {
                   key={r} 
                   onClick={() => supabase.from('game_state').update({ current_round: r }).eq('id', 1)}
                   className={`px-3 md:px-4 py-2 text-xs md:text-sm font-bold uppercase tracking-wider rounded-lg transition-all duration-200 ${
-                    selectedRound === r 
+                    gameState?.current_round === r 
                       ? 'bg-blue-600 text-white shadow-lg scale-105' 
                       : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
                   }`}
@@ -353,10 +440,10 @@ const GameScreen = () => {
                     Ready for Round
                   </div>
                   <div className="text-4xl md:text-6xl font-black text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-purple-400">
-                    {selectedRound}
+                    {gameState?.current_round}
                   </div>
                   <div className="text-sm text-slate-500 mt-4">
-                    {getPointsForRound(selectedRound)} points on correct answer
+                    {getPointsForRound(gameState?.current_round)} points on correct answer
                   </div>
                 </div>
               </div>
@@ -421,7 +508,7 @@ const GameScreen = () => {
               <div className="relative z-10">
                 <div className="flex justify-center items-center gap-3 mb-6 opacity-70 flex-wrap">
                   <span className="font-bold tracking-wider uppercase text-xs md:text-sm bg-blue-100 text-blue-700 px-3 md:px-4 py-1 rounded-full">{localCategory}</span>
-                  <span className="font-bold tracking-wider uppercase text-xs md:text-sm bg-yellow-100 text-yellow-700 px-3 md:px-4 py-1 rounded-full">{selectedRound} - {getPointsForRound(selectedRound)}pts</span>
+                  <span className="font-bold tracking-wider uppercase text-xs md:text-sm bg-yellow-100 text-yellow-700 px-3 md:px-4 py-1 rounded-full">{gameState?.current_round} - {getPointsForRound(gameState?.current_round)}pts</span>
                 </div>
                 <h1 className="text-2xl md:text-4xl font-extrabold leading-tight text-slate-800">
                   {displayQuestion?.question_text}
@@ -482,7 +569,7 @@ const GameScreen = () => {
                   {revealResult === 'correct' ? (
                     <span className="flex items-center gap-3 text-2xl md:text-3xl">
                       <CheckCircle size={32} className="animate-bounce" /> Correct!
-                      <span className="text-3xl md:text-4xl font-black text-green-300">+{getPointsForRound(selectedRound)}</span>
+                      <span className="text-3xl md:text-4xl font-black text-green-300">+{getPointsForRound(gameState?.current_round)}</span>
                     </span>
                   ) : (
                     <span className="flex items-center gap-3 text-2xl md:text-3xl">

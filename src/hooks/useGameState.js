@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { supabase } from '../supabaseClient';
 
 export const useGameState = () => {
@@ -8,7 +8,7 @@ export const useGameState = () => {
   const [currentQuestion, setCurrentQuestion] = useState(null);
   const [currentCategoryName, setCurrentCategoryName] = useState(null);
 
-  const fetchInitialData = async () => {
+  const fetchInitialData = useCallback(async () => {
     try {
       // 1. Fetch Game State
       const { data: state, error: stateError } = await supabase.from('game_state').select('*').single();
@@ -17,8 +17,12 @@ export const useGameState = () => {
         return;
       }
       
-      // 2. Fetch Teams (Sorted by Score for Leaderboard)
-      const { data: teamList } = await supabase.from('teams').select('*').order('score', { ascending: false });
+      // 2. Fetch Teams (In original order)
+      const { data: teamList, error: teamsError } = await supabase.from('teams').select('*').order('id', { ascending: true });
+      if (teamsError) {
+        console.error('Error fetching teams:', teamsError);
+      }
+      console.log('Teams fetched from DB:', teamList);
       
       // 3. Fetch Categories (For Wheel & Dropdowns)
       const { data: catList } = await supabase.from('categories').select('*');
@@ -60,7 +64,7 @@ export const useGameState = () => {
     } catch (err) {
       console.error('Error in fetchInitialData:', err);
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchInitialData();
@@ -88,7 +92,7 @@ export const useGameState = () => {
     return () => {
       subscriptions.forEach(sub => supabase.removeChannel(sub));
     };
-  }, []);
+  }, [fetchInitialData]);
 
-  return { gameState, teams, categories, currentQuestion, currentCategoryName };
+  return { gameState, teams, categories, currentQuestion, currentCategoryName, refetchTeams: fetchInitialData };
 };
